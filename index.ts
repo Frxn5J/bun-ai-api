@@ -1,6 +1,6 @@
 import { groqServices } from './services/groq';
 import { cerebrasServices } from './services/cerebras';
-import { openrouterServices } from './services/openrouter';
+import { openrouterFreeServices, openrouterPaidServices } from './services/openrouter';
 import { mistralService } from './services/mistral';
 import { codestralService } from './services/codestral';
 import { geminiServices } from './services/gemini';
@@ -8,17 +8,23 @@ import { cohereService } from './services/cohere';
 import { nvidiaService } from './services/nvidia';
 import type { AIService, ChatRequest } from './types';
 
-// ─── Service pool ────────────────────────────────────────────────────────────
+// ─── Service pool ─────────────────────────────────────────────────────────────
 
-const allServices: AIService[] = [
-  ...groqServices,        // 12 models (7 with tools)
-  ...openrouterServices,  // 24 models (12 with tools)
-  ...cerebrasServices,    //  3 models
-  ...geminiServices,      //  7 models (Gemini 3/2.5 Flash + Gemma 3)
-  mistralService,         //  1 model  (tools ✅)
-  codestralService,       //  1 model  (tools ✅)
-  cohereService,          //  1 model
-  nvidiaService,          //  1 model  (tools ✅)
+/** Free models — included in automatic rotation */
+const freeServices: AIService[] = [
+  ...groqServices,            // dynamic (7 with tools)
+  ...openrouterFreeServices,  // dynamic free (auto-discovered)
+  ...cerebrasServices,        // 3 models
+  ...geminiServices,          // 7 models (Gemini/Gemma)
+  mistralService,             // tools ✅
+  codestralService,           // tools ✅
+  cohereService,
+  nvidiaService,              // tools ✅
+];
+
+/** Paid OpenRouter models — only used when explicitly requested by name */
+const paidServices: AIService[] = [
+  ...openrouterPaidServices,
 ];
 
 // ─── State tracking ──────────────────────────────────────────────────────────
@@ -30,32 +36,70 @@ interface ServiceState {
   service: AIService;
   cooldownUntil: number;
   disabled: boolean;
+  /** If true, excluded from auto-routing pools — only accessible by explicit name */
+  paidOnly: boolean;
 }
 
-const states: ServiceState[] = allServices.map(s => ({
-  service: s,
-  cooldownUntil: 0,
-  disabled: false,
-}));
+const states: ServiceState[] = [
+  ...freeServices.map(s => ({ service: s, cooldownUntil: 0, disabled: false, paidOnly: false })),
+  ...paidServices.map(s => ({ service: s, cooldownUntil: 0, disabled: false, paidOnly: true })),
+];
 
-let preferred = 0;
+// ─── Routing pools ──────────────────────────────────────────────────────────
+
+/**
+ * AGENT_MODELS: comma-separated list of model names to use exclusively
+ * when the request includes tools (agent/agentic mode).
+ *
+ * Example in .env:
+ *   AGENT_MODELS=Groq/llama-3.3-70b-versatile,Mistral (La Plateforme),Cerebras/llama-3.3-70b
+ *
+ * If not set, the router uses all models that support tools.
+ */
+const AGENT_MODEL_NAMES: string[] = (process.env.AGENT_MODELS ?? '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+/** Returns the sub-pool for the given mode. Paid-only models are always excluded. */
+function getPool(requireTools: boolean): ServiceState[] {
+  if (requireTools) {
+    // Agent pool: use explicit list if configured, else all tool-supporting models
+    return AGENT_MODEL_NAMES.length > 0
+      ? states.filter(s => AGENT_MODEL_NAMES.includes(s.service.name) && s.service.supportsTools && !s.disabled && !s.paidOnly)
+      : states.filter(s => s.service.supportsTools && !s.disabled && !s.paidOnly);
+  }
+  // Chat pool: all non-disabled, non-paid models
+  return states.filter(s => !s.disabled && !s.paidOnly);
+}
+
+/** Separate sticky indices for each pool. */
+let preferredChat = 0;
+let preferredAgent = 0;
 
 function getService(requireTools: boolean): ServiceState {
   const now = Date.now();
+  const pool = getPool(requireTools);
 
-  for (let i = 0; i < states.length; i++) {
-    const s = states[(preferred + i) % states.length]!;
-    if (s.disabled) continue;
-    if (requireTools && !s.service.supportsTools) continue;
+  if (pool.length === 0) {
+    // Fallback: any non-disabled service
+    return states.find(s => !s.disabled) ?? states[0]!;
+  }
+
+  const pref = requireTools ? preferredAgent : preferredChat;
+
+  for (let i = 0; i < pool.length; i++) {
+    const s = pool[(pref + i) % pool.length]!;
     if (s.cooldownUntil <= now) {
-      preferred = (preferred + i) % states.length;
+      const next = (pref + i) % pool.length;
+      if (requireTools) preferredAgent = next;
+      else preferredChat = next;
       return s;
     }
   }
 
-  // All eligible in cooldown — pick soonest
-  const eligible = states.filter(s => !s.disabled && (!requireTools || s.service.supportsTools));
-  return eligible.reduce((a, b) => (a.cooldownUntil < b.cooldownUntil ? a : b)) as ServiceState;
+  // All in cooldown — pick soonest available
+  return pool.reduce((a, b) => (a.cooldownUntil < b.cooldownUntil ? a : b))!;
 }
 
 function handleServiceError(state: ServiceState, err: any): void {
@@ -85,7 +129,14 @@ function handleServiceError(state: ServiceState, err: any): void {
     console.warn(`[${name}] Error ${status || 'unknown'} → cooldown 10 s`);
   }
 
-  preferred = (idx + 1) % states.length;
+  // Advance the preferred index away from the failed service
+  const pool = getPool(state.service.supportsTools);
+  const idxInPool = pool.indexOf(state);
+  if (idxInPool >= 0) {
+    const next = (idxInPool + 1) % pool.length;
+    if (state.service.supportsTools) preferredAgent = next;
+    else preferredChat = next;
+  }
 }
 
 // ─── CORS ────────────────────────────────────────────────────────────────────
@@ -303,7 +354,7 @@ const server = Bun.serve({
       }
       // Reset all
       states.forEach(s => { s.cooldownUntil = 0; s.disabled = false; });
-      preferred = 0;
+      preferredChat = 0; preferredAgent = 0;
       console.log('[Admin] Reset ALL services');
       return new Response(JSON.stringify({ ok: true, reset: 'all', count: states.length }),
         { headers: withCors({ 'Content-Type': 'application/json' }) });
