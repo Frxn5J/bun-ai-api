@@ -6,6 +6,7 @@ import { codestralService } from './services/codestral';
 import { geminiServices } from './services/gemini';
 import { cohereService } from './services/cohere';
 import { nvidiaService } from './services/nvidia';
+import { alibabaServices } from './services/alibaba';
 import type { AIService, ChatRequest } from './types';
 
 // ─── Service pool ─────────────────────────────────────────────────────────────
@@ -16,6 +17,7 @@ const freeServices: AIService[] = [
   ...openrouterFreeServices,  // dynamic free (auto-discovered)
   ...cerebrasServices,        // 3 models
   ...geminiServices,          // 7 models (Gemini/Gemma)
+  ...alibabaServices,         // Alibaba DashScope models
   mistralService,             // tools ✅
   codestralService,           // tools ✅
   cohereService,
